@@ -147,10 +147,10 @@
      (assoc ?pstate :peek-lex (nth (:peek-lexemes ?pstate) (dec n)))
      (assoc ?pstate :peek (:token (:peek-lex ?pstate))))))
 
-(defn peek
+(defn look
   "Assumes that peek-token n has been executed."
   ([pstate]
-   (peek pstate 1))
+   (look pstate 1))
   ([pstate n]
    (:token (nth (:peek-lexemes pstate) (dec n)))))
 
@@ -310,17 +310,17 @@
   (as-> pstate ?pstate
     (assert-token ?pstate \_)
     (peek-token ?pstate 3)
-    (cond (number? (peek ?pstate))
+    (cond (number? (look ?pstate))
           (as-> ?pstate ?ps
             (read-token ?ps)
             (assoc ?ps :subscript (->Subscript (:tkn ?ps)))),
-          (and (= \{ (peek ?pstate)) (= \} (peek ?pstate 3)))
+          (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (read-token ?ps)
             (assoc ?ps :subscript (->Subscript (:tkn ?ps)))
             (assert-token ?ps \}))
-          (= \{ (peek ?pstate))
+          (= \{ (look ?pstate))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (parse :expression ?ps)
@@ -334,17 +334,17 @@
   (as-> pstate ?pstate
     (assert-token ?pstate \^)
     (peek-token ?pstate 3)
-    (cond (number? (peek ?pstate))
+    (cond (number? (look ?pstate))
           (as-> ?pstate ?ps
             (read-token ?ps)
             (assoc ?ps :superscript (->Superscript (:tkn ?ps)))),
-          (and (= \{ (peek ?pstate)) (= \} (peek ?pstate 3)))
+          (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (read-token ?ps)
             (assoc ?ps :superscript (->Superscript (:tkn ?ps)))
             (assert-token ?ps \}))
-          (= \{ (peek ?pstate))
+          (= \{ (look ?pstate))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (parse :expression ?ps)
@@ -493,10 +493,9 @@
                [:realURI :hasMessage {:value (str err) :type :xsd:string}])
   @+triples+)
 
-;;;====================== Temporary Testing =========================
-
-(defn tryme
+(defn process-math
   [input]
+  "Toplevel form that takes a formula wrapped in dollar signs, e.g. $ y = 1 $"
   (let [result (->> input
                     (preprocess-math)
                     (parse :math))]
@@ -505,9 +504,7 @@
            ((if (= (type result) MathExp) math2owl error2owl))
            (map #(expand-all context+ %))
            (edn-ld.jena/write-triple-string prefixes)
-           (println))
-      (println "\n\n +triples+ =")
-      (pprint @+triples+))))
+           (println)))))
 
 (def i1 "$Y = \\beta_0$ ")
 (def i2 "$Y = \\beta_1X_1$")
