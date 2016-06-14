@@ -4,17 +4,15 @@ A Clojure library to parse LaTeX math to OWL. We use it on formulas embedded in 
 
 ## Installation
 
+For demonstration:
+
 1. Download the [leiningen shell script](http://leiningen.org/).
 2. Type 'lein deps' at a shell prompt in the facility directory and wait while it downloads 
     all the related libraries. 
 3. Type 'lein repl' at a shell prompt in the facility directory and waiting for a clojure prompt.
-4. At the clojure prompt, type (-main :port 3034) and verify that things are working: (Point browser at http://localhost:3034)
+4. (tryme "$ x = 1$")
 
-If you do not plan to do development on the server, then the easiest way to use the server is to create an uberjar: at a shell prompt in the project directory type:
 
-```
-lein uberjar
-```
 
 ## Disclaimer
 The use of any software or hardware by the project does not imply a recommendation or endorsement by NIST.
