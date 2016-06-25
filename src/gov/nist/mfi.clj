@@ -19,7 +19,8 @@
 ;;; Purpose: Parse latex mathematical expressions into OWL statements.
 
 ;;; ToDo:
-;;;          - It may be that I'll need a stack to save variables, rather than just a atomic element on the map. 
+;;;          - Consider a rewrite that uses clojure.spec. (Is that feasible?)
+;;;          - Replace 'defparse named' atomic elements on map with a stack of such elements. (There is a bug otherwise!)
 ;;;          - Write owl axioms for relations.
 ;;;          - Write results to in-memory jena.
 ;;;          - Write SPARQL to recover mathematical expressions.
@@ -158,10 +159,10 @@
   "Read a token and check that it is what was expected."
   [pstate tkn]
   (as-> pstate ?pstate
-   (read-token ?pstate)
-   (if (= tkn (:tkn ?pstate))
-     ?pstate
-     (assoc pstate :error (str "expected: " tkn " got: " (:tkn pstate))))))
+   (peek-token ?pstate)
+   (if (= tkn (:peek ?pstate))
+     (read-token ?pstate)
+     (assoc ?pstate :error (str "expected: " tkn " got: " (:tkn pstate))))))
 
 ;;; ============ Parser (doesn't care about lexemes, just :tkn and :peek)  =============
 ;(remove-all-methods parse)
@@ -314,12 +315,16 @@
           (as-> ?pstate ?ps
             (read-token ?ps)
             (assoc ?ps :subscript (->Subscript (:tkn ?ps)))),
+          (= 1 (count (:id (look ?pstate)))) ; symbol of one letter!
+          (as-> ?pstate ?ps    
+            (parse :symbol-number ?ps) ; FIX THIS I want cut the expression down to a single term ??? Maybe just check for subj in serialize??
+            (assoc ?ps :subscript (->Subscript (:tkn ?ps)))),
           (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (read-token ?ps)
             (assoc ?ps :subscript (->Subscript (:tkn ?ps)))
-            (assert-token ?ps \}))
+            (assert-token ?ps \})),
           (= \{ (look ?pstate))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
@@ -334,7 +339,7 @@
   (as-> pstate ?pstate
     (assert-token ?pstate \^)
     (peek-token ?pstate 3)
-    (cond (number? (look ?pstate))
+    (cond (or (number? (look ?pstate)) (= 1 (count (:id (look ?pstate)))))
           (as-> ?pstate ?ps
             (read-token ?ps)
             (assoc ?ps :superscript (->Superscript (:tkn ?ps)))),
