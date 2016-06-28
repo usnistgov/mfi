@@ -17,6 +17,8 @@
 (use 'clojure.inspector) ; POD Temporary
 
 ;;; Purpose: Parse latex mathematical expressions into OWL statements.
+;;; Strictly functional in parsing, as little weird, a little verbose, a little easier to debug.
+;;; It was experimental. My mind is still not made up about it.
 
 ;;; ToDo:
 ;;;          - Consider a rewrite that uses clojure.spec. (Is that feasible?)
@@ -30,10 +32,15 @@
 
 (defmacro ^:private defparse [tag [pstate & params] & body] 
   `(defmethod parse ~tag [~'tag ~pstate & {:keys [~@params]}]
-     (reset! +debug+ (assoc ~pstate :tag ~tag))
-     (if-let [err# (:error ~pstate)] ; Need to return a MathExp either way.
-       {:tkn :eof :char-stream "" :peek-stream "" :error err# :tag ~tag}
-       (do ~@body))))
+     (as-> ~pstate ~pstate
+       (reset! +debug+ (assoc ~pstate :tag ~tag))
+       (if-let [err# (:error ~pstate)] ; Need to return a MathExp either way.
+         {:tkn :eof :char-stream "" :error err# :tag ~tag}
+         (as-> ~pstate ~pstate
+           (update-in ~pstate [:local] conj {})
+           ~@body
+           (reset! +debug+ (assoc ~pstate :tag ~tag))
+           (update-in ~pstate [:local] pop))))))
 
 ;;; ============ Lexer ===============================================================
 (defn- gather-whitesp ; POD this was borrowed from something that had /* */ comments. Overkill!
@@ -113,39 +120,39 @@
     pstate))
 
 (defn- read-token
-  "Really read a token."
+  "Consume a token, either from peek or the real stream."
   [pstate]
   (if-let [plex (first (:peek-lexemes pstate))]
-    (-> pstate
-        (assoc :lex plex)
-        (assoc :tkn (:token plex))
-        (update-in [:peek-lexemes] #(vec (rest %)))
-        (update-in [:char-stream] subs (+ (count (:raw plex)) (count (:ws plex)))))
+    (as-> pstate ?pstate
+      (assoc ?pstate :lex plex)
+      (assoc ?pstate :tkn (:token plex))
+      (update-in ?pstate [:peek-lexemes] #(vec (rest %)))
+      (assoc ?pstate :peek-lex (first (:peek-lexemes ?pstate)))
+      (assoc ?pstate :peek (:token (:peek-lex ?pstate))))
     (let [lex (token-from-stream (:char-stream pstate))]
       (-> pstate
           (check-for-errors lex)
           (assoc :lex lex)
           (assoc :tkn (:token lex))
-          (update-in [:char-stream] subs (+ (count (:raw lex)) (count (:ws lex))))
-          (update-in [:peek-stream] subs (+ (count (:raw lex)) (count (:ws lex))))))))
+          (update-in [:char-stream] subs (+ (count (:raw lex)) (count (:ws lex))))))))
 
 (defn- peek-token
-  "Return a lexeme without changing the :char-stream."
+  "Return a lexeme."
   ([pstate] (peek-token pstate 1))
   ([pstate n]
    (as-> pstate ?pstate
      (loop [cnt (- n (count (:peek-lexemes ?pstate)))
             ps ?pstate]
        (if (> cnt 0)
-         (let [lex (token-from-stream (:peek-stream ps))]
+         (let [lex (token-from-stream (:char-stream ps))]
            (recur (dec cnt)
                   (-> ps
                       (check-for-errors lex)
                       (update-in [:accum-str] str (:ws lex) (:raw lex)) 
-                      (update-in [:peek-stream] subs (+ (count (:raw lex)) (count (:ws lex))))
+                      (update-in [:char-stream] subs (+ (count (:raw lex)) (count (:ws lex))))
                       (update-in [:peek-lexemes] conj lex))))
          ps))
-     (assoc ?pstate :peek-lex (nth (:peek-lexemes ?pstate) (dec n)))
+     (assoc ?pstate :peek-lex (nth (:peek-lexemes ?pstate) (dec n) nil))
      (assoc ?pstate :peek (:token (:peek-lex ?pstate))))))
 
 (defn look
@@ -182,10 +189,10 @@
     (parse :expression ?pstate)
     (peek-token ?pstate)
     (if (= :eof (:peek ?pstate))
-      (assoc ?pstate :math (->MathExp (:expression ?pstate)))
+      (assoc ?pstate :math (->MathExp (:result ?pstate)))
       (as-> ?pstate ?ps
-        (parse :relation ?ps :lhs (:expression ?ps))
-        (assoc ?ps :math (->MathExp (:relation ?ps)))))))
+        (parse :relation ?ps :lhs (:result ?ps))
+        (assoc ?ps :math (->MathExp (:result ?ps)))))))
 
 (defrecord Relation [lhs rel rhs])
 
@@ -194,15 +201,18 @@
   [pstate lhs]
   (as-> pstate ?pstate
     (if lhs
-      (assoc ?pstate :lhs lhs)
+      (assoc-in ?pstate [:local 0 :lhs] lhs)
       (as-> ?pstate ?ps
-        (parse :expression ?ps) 
-        (assoc ?ps :lhs (:expression ?ps))))
+        (parse :expression ?ps)
+        (assoc-in ?ps [:local 0 :lhs] (:result ?ps))))
     (parse :rel-op ?pstate)
+    (assoc-in ?pstate [:local 0 :rel-op] (:result ?pstate))
     (parse :expression ?pstate)
-    (assoc ?pstate :rhs (:expression ?pstate))
-    (assoc ?pstate :relation
-           (->Relation (:lhs ?pstate) (:rel-op ?pstate) (:rhs ?pstate)))))
+    (assoc-in ?pstate [:local 0 :rhs]  (:result ?pstate))
+    (assoc ?pstate :result
+           (->Relation (-> ?pstate :local first :lhs)
+                       (-> ?pstate :local first :rel-op)
+                       (-> ?pstate :local first :rhs)))))
 
 ;;; rel-op == = | > | < | :leq | :geq
 (defparse :rel-op
@@ -212,7 +222,7 @@
     (let [tkn (get {\= :equal, \> :gt, \< :lt, :leq :leq, :geq :geq} (:tkn ?pstate) :error)]
       (if (= tkn :error)
         (assoc ?pstate :error {:expected "rel-op" :got (:tkn ?pstate)})
-        (assoc ?pstate :rel-op tkn)))))
+        (assoc ?pstate :result tkn)))))
           
 (defn- add-op-p [tkn]
   (#{\+ \-} tkn))
@@ -224,22 +234,40 @@
     (let [tkn (get {\+ :plus, \- :minus} (:tkn ?pstate) :error)]
       (if (= tkn :error)
         (assoc ?pstate :error {:expected "add-op" :got (:tkn ?pstate)})
-        (assoc ?pstate :add-op tkn)))))
+        (assoc ?pstate :result tkn)))))
 
 (defrecord Expression [term op exp])
 
-;;; expression == term [add-op expression]+
+;;; expression == term [add-op expression]+ | 
 (defparse :expression
   [pstate]
+  (peek-token pstate)
+  (if (= \( (:peek pstate))
+    (parse :primary pstate)
+    (as-> pstate ?pstate
+      (parse :term ?pstate)
+      (assoc-in ?pstate [:local 0 :term] (:result ?pstate))
+      (peek-token ?pstate)
+      (if (add-op-p (:peek ?pstate))
+        (as-> ?pstate ?ps
+          (parse :add-op ?ps)
+          (assoc-in ?ps [:local 0 :add-op] (:result ?ps))
+          (parse :expression ?ps)
+          (assoc-in ?ps [:local 0 :expression] (:result ?ps)))
+        ?pstate)
+      (assoc ?pstate :result (->Expression (-> ?pstate :local first :term)
+                                           (-> ?pstate :local first :add-op)
+                                           (-> ?pstate :local first :expression))))))
+
+;;; Primary == '(' expression ')'
+(defparse :primary
+  [pstate]
   (as-> pstate ?pstate
-    (parse :term ?pstate)
-    (peek-token ?pstate)
-    (if (add-op-p (:peek ?pstate))
-      (as-> ?pstate ?ps
-        (parse :add-op ?ps)
-        (parse :expression ?ps)
-        (assoc ?ps :expression (map->Expression {:term (:term ?ps) :op (:add-op ?ps) :exp (:expression ?ps)})))
-      (assoc ?pstate :expression (map->Expression {:term (:term ?pstate)})))))
+      (assert-token ?pstate \()
+      (parse :expression ?pstate)
+      (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
+      (assert-token ?pstate \))
+      (assoc ?pstate :result (-> ?pstate :local first :exp))))
 
 (defn- unary-op-p
   [tkn]
@@ -256,30 +284,32 @@
 (defparse :term 
   [pstate]
   (as-> pstate ?pstate
-    (assoc ?pstate :factors [])
+    (assoc-in ?pstate [:local 0 :factors] [])
     (peek-token ?pstate)
     (if (unary-op-p (:peek ?pstate))
-      (parse :unary-op ?pstate)
-      (assoc ?pstate :unary-op nil))
+      (as-> ?pstate ?ps
+        (parse :unary-op ?ps)
+        (assoc-in ?ps [:local 0 :unary-op] (:result ?ps)))
+      ?pstate)
     (loop [ps (parse :factor ?pstate)]
       (as-> ps ?ps
-        (update-in ?ps [:factors] conj (:factor ?ps))
+        (update-in ?ps [:local 0 :factors] conj (:result ?ps))
         (peek-token ?ps)
         (if (= Symbol (type (:peek ?ps)))
           (recur (parse :factor ?ps))
           ?ps)))
-    (assoc ?pstate :term (map->Term {:unary-op (:unary-op ?pstate)
-                                     :factors (:factors ?pstate)}))))
+    (assoc ?pstate :result (->Term (-> ?pstate :local first :unary-op)
+                                   (-> ?pstate :local first :factors)))))
 
-(defrecord Factor [symbol subscript superscript])
+
+(defrecord Factor [symbol-number subscript superscript])
 
 ;;; factor == symbol-number ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 (defparse :factor  
   [pstate]
   (as-> pstate ?pstate
-    (assoc ?pstate :subscript nil)
-    (assoc ?pstate :superscript nil)
-    (parse :symbol-number ?pstate) ; can be a number
+    (parse :symbol-number ?pstate)
+    (assoc-in ?pstate [:local 0 :symbol-number] (:result ?pstate))
     (peek-token ?pstate)
     (if (#{\_ \^} (:peek ?pstate))
       (loop [ps ?pstate
@@ -287,19 +317,25 @@
         (if (and (> cnt 0) (#{\_ \^} (:peek ps)))
           (as-> ps ?ps
             (if (= (:peek ?ps) \_)
-              (parse :subscript ?ps)
-              (parse :superscript ?ps))
+              (as-> ?ps ?ps1
+                (parse :subscript ?ps1)
+                (assoc-in ?ps1 [:local 0 :subscript] (:result ?ps1)))
+              (as-> ?ps ?ps1
+                (parse :superscript ?ps1)
+                (assoc-in ?ps1 [:local 0 :superscript] (:result ?ps1))))
             (recur (peek-token ?ps) (dec cnt)))
           ps))
-      ?pstate) 
-    (assoc ?pstate :factor (->Factor (:symbol-number ?pstate) (:subscript ?pstate) (:superscript ?pstate)))))
+      ?pstate)
+    (assoc ?pstate :result (->Factor (-> ?pstate :local first :symbol-number)
+                                     (-> ?pstate :local first :subscript)
+                                     (-> ?pstate :local first :superscript)))))
 
 (defparse :symbol-number
   [pstate]
   (as-> pstate ?pstate
     (read-token ?pstate)
     (if (or (number? (:tkn ?pstate)) (= Symbol (type (:tkn ?pstate))))
-      (assoc ?pstate :symbol-number (:tkn ?pstate))
+      (assoc ?pstate :result (:tkn ?pstate))
       (assoc ?pstate :error {:expected "symbol or number" :got (:tkn ?pstate)}))))
       
 (defrecord Subscript [exp])
@@ -314,24 +350,23 @@
     (cond (number? (look ?pstate))
           (as-> ?pstate ?ps
             (read-token ?ps)
-            (assoc ?ps :subscript (->Subscript (:tkn ?ps)))),
+            (assoc ?ps :result (->Subscript (:tkn ?ps)))),
           (= 1 (count (:id (look ?pstate)))) ; symbol of one letter!
-          (as-> ?pstate ?ps    
+          (as-> ?pstate ?ps
             (parse :symbol-number ?ps) ; FIX THIS I want cut the expression down to a single term ??? Maybe just check for subj in serialize??
-            (assoc ?ps :subscript (->Subscript (:tkn ?ps)))),
+            (assoc ?ps :result (->Subscript (:result ?ps))))
           (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (read-token ?ps)
-            (assoc ?ps :subscript (->Subscript (:tkn ?ps)))
+            (assoc ?ps :result (->Subscript (:tkn ?ps)))
             (assert-token ?ps \})),
           (= \{ (look ?pstate))
           (as-> ?pstate ?ps
             (assert-token ?ps \{)
             (parse :expression ?ps)
-            (assoc ?ps :subscript (->Subscript (:expression ?ps)))
+            (assoc ?ps :result (->Subscript (:result ?ps)))
             (assert-token ?ps \})))))
-
 
 ;;; superscript ==  ^ expression | ^ \{ expression \}
 (defparse :superscript
@@ -364,10 +399,9 @@
     (if (or (not d1) (not d2) (not= d1 d2) (= \$ (first math)) (= \$ (last math)))
       {:error "The input math expression must start with $ and end with $, or start with $$ and end with $$."}
       {:char-stream math
-       :peek-stream math
        :peek-lexemes []
+       :local []
        :accum-str ""})))
-
 
 ;;;============= Conversion to OWL/Turtle ========================================
 (defn new-blank-node  
@@ -448,12 +482,12 @@
                       {:value (str (swap! +factor-order+ inc)) :type :xsd:nonNegativeInteger}])))
     term))
 
-;;; (defrecord Factor [symbol value subscript superscript])
+;;; (defrecord Factor [symbol-number value subscript superscript])
 (defmethod math2owl Factor
   [elem & {:keys [subj]}]
   (let [factor (new-blank-node "factor")]
     (add-triples [subj :hasFactor factor])
-    (if-let [vn  (:symbol elem)] 
+    (if-let [vn  (:symbol-number elem)] 
       (let [var (math2owl vn :subj factor)]
         (when-let [sub (:subscript   elem)] (add-triples [var :hasSubscript   (math2owl sub :subj factor)]))
         (when-let [sup (:superscript elem)] (add-triples [var :hasSuperscript (math2owl sup :subj factor)])))
@@ -475,7 +509,7 @@
     (add-triples [sub :rdf:type :Subscript]
                  [sub :hasExpression (if (number? (:exp elem))
                                        {:value (:exp elem) :type :xsd:decimal}
-                                       (math2owl (:exp elem)))])
+                                       (math2owl (:exp elem) :subj sub))])
     sub))
 
 (defmethod math2owl Superscript
@@ -484,7 +518,7 @@
     (add-triples [sup :rdf:type :Superscript]
                  [sup :hasExpression (if (number? (:exp elem))
                                        {:value (:exp elem) :type :xsd:decimal} 
-                                       (math2owl (:exp elem)))])
+                                       (math2owl (:exp elem) :subj sup))])
     sup))
 
 (defmethod math2owl :default
@@ -517,6 +551,6 @@
 (def i4 "$ F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}$")
 (def i5 "$  V^{\\alpha} $")
 (def i6 "$ (X) $")
-(def i7 "$Y = \\beta_0 + \\beta_1X_1 + \\beta_2X_2 + \\beta_3X_3 + \\beta_{12}X_1X_2 + \\beta_{13}X_1X_3 + \\beta_{23}X_2X_3 + \\beta_{11}X_1^2 + \\beta_{22}X_2^2 + \\beta_{33}X_3^2 + experimental\\ error$")
+(def i7 "$Y = \\beta_0 + \\beta_1X_1 + \\beta_2X_2 + \\beta_3X_3 + \\beta_{12}X_1X_2 + \\beta_{13}X_1X_3 + \\beta_{23}X_2X_3 + \\beta_{11}X_1^2 + \\beta_{22}X_2^2 + \\beta_{33}X_3^2 + experimentalerror$")
     
 
