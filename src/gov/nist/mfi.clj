@@ -17,17 +17,14 @@
 (use 'clojure.inspector) ; POD Temporary
 
 ;;; Purpose: Parse latex mathematical expressions into OWL statements.
-;;; Strictly functional in parsing, as little weird, a little verbose, a little easier to debug.
-;;; It was experimental. My mind is still not made up about it.
+;;; The parsing functions are 'internally' functional (using threading macros on parse state).
+;;; This seems a little weird at times, but it really does make debugging easier. 
 
 ;;; ToDo:
 ;;;          - i7 looks botched.
-;;;          - Change (parse :tag pstate) to (parse pstate :tag) and change every (as-> ...) to (-> ...)
+;;;          - simpler gather-whitespace
 ;;;          - Consider a rewrite that uses clojure.spec. (Is that feasible?)
-;;;          - Replace 'defparse named' atomic elements on map with a stack of such elements. (There is a bug otherwise!)
-;;;          - Write owl axioms for relations.
 ;;;          - Write results to in-memory jena.
-;;;          - Write SPARQL to recover mathematical expressions.
 
 (def ^:private +debug+ (atom nil))
 (defrecord MathExp [content])
@@ -37,17 +34,16 @@
   `(defmethod parse ~tag [~'tag ~pstate ~@(or keys-form '(& ignore))]
      (as-> ~pstate ~pstate
        (reset! +debug+ (update-in ~pstate [:tags] conj ~tag))
-       (update-in ~pstate [:local] conj {})
+       (update-in ~pstate [:local] #(into [{}] %))
        (if (:error ~pstate) 
-         (as-> ~pstate ~pstate ; Try to stop things, saving stream for debugging. 
+         (as-> ~pstate ~pstate ; Stop things, saving stream for debugging. 
            (assoc ~pstate :debug-stream (:char-stream ~pstate))
            (assoc ~pstate :char-stream "")
            (assoc ~pstate :tkn :eof))
          (as-> ~pstate ~pstate
            ~@body))
        (reset! +debug+ (update-in ~pstate [:tags] pop))
-       (update-in ~pstate [:local] pop))))
-
+       (update-in ~pstate [:local] #(vec (rest %))))))
 
 ;;; ============ Lexer ===============================================================
 (defn- gather-whitesp ; POD this was borrowed from something that had /* */ comments. Overkill!
@@ -245,39 +241,33 @@
   [pstate]
   (as-> pstate ?pstate
     (read-token ?pstate)
-    (let [tkn (get {\+ :plus, \- :minus} (:tkn ?pstate) :error)]
+    (let [tkn (get {\+ :plusOp, \- :minusOp} (:tkn ?pstate) :error)]
       (if (= tkn :error)
         (assoc ?pstate :error {:expected "add-op" :got (:tkn ?pstate)})
         (assoc ?pstate :result tkn)))))
 
 (defrecord Expression [term op exp])
 
-;;; Typical 
-;;; <expression> ::= <term> | <expression> add-op" <term>
-;;; <term>       ::= <factor> | <term>  <factor>
-;;; <factor>     ::= <constant> | <variable> | "(" <expression> ")"
-
-
-;;; expression == term [add-op expression]+ | primary
+;;; expression == ( term [add-op expression]+ ) | primary
 (defparse :expression
-  [pstate]
+  [pstate & {:keys [torder] :or {torder 1}}]
   (peek-token pstate)
   (as-> pstate ?pstate
-    (parse :term ?pstate)
+    (parse :term ?pstate :torder torder)
     (assoc-in ?pstate [:local 0 :term] (:result ?pstate))
     (peek-token ?pstate)
     (if (add-op-p (:peek ?pstate))
       (as-> ?pstate ?ps
         (parse :add-op ?ps)
         (assoc-in ?ps [:local 0 :add-op] (:result ?ps))
-        (parse :expression ?ps)
+        (parse :expression ?ps :torder (inc torder))
         (assoc-in ?ps [:local 0 :expression] (:result ?ps)))
       ?pstate)
     (assoc ?pstate :result (->Expression (-> ?pstate :local first :term)
                                          (-> ?pstate :local first :add-op)
                                          (-> ?pstate :local first :expression)))))
 
-;;; math-op = frac | 
+;;; math-op = frac | sum | integral
 (defparse :math-op
   [pstate]
   (let [name (:name (:peek pstate))]
@@ -332,12 +322,12 @@
   [pstate]
   (assert-token pstate \-))
 
-(defrecord Term [unary-op factors])
+(defrecord Term [unary-op factors order])
 
 ;;; Example terms \\beta_3X_3  \\beta_{12}X_1X_2  123 X 
 ;;; term == (unary-op)? factor [factor]*
 (defparse :term 
-  [pstate]
+  [pstate & {:keys [torder]}]
   (as-> pstate ?pstate
     (assoc-in ?pstate [:local 0 :factors] [])
     (peek-token ?pstate)
@@ -346,23 +336,24 @@
         (parse :unary-op ?ps)
         (assoc-in ?ps [:local 0 :unary-op] (:result ?ps)))
       ?pstate)
-    (loop [ps (parse :factor ?pstate)]
+    (loop [forder 1 
+           ps (parse :factor ?pstate :forder forder)]
       (as-> ps ?ps
         (update-in ?ps [:local 0 :factors] conj (:result ?ps))
         (peek-token ?ps)
         (if (not (#{\= \< \> \+ \- \} \) :eof} (:peek ?ps)))
-          (recur (parse :factor ?ps))
+          (recur (inc forder) (parse :factor ?ps :forder (inc forder)))
           ?ps)))
     (assoc ?pstate :result (->Term (-> ?pstate :local first :unary-op)
-                                   (-> ?pstate :local first :factors)))))
+                                   (-> ?pstate :local first :factors)
+                                   torder))))
 
-
-(defrecord Factor [symbol-number subscript superscript])
+(defrecord Factor [symbol-number subscript superscript order])
 
 ;;; factor ==   symbol-number ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 ;;;           | primary       ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 (defparse :factor  
-  [pstate]
+  [pstate & {:keys [forder]}]
   (as-> pstate ?pstate
     (if (or (= \( (:peek ?pstate)) (= LaTeX (type (:peek ?pstate))))
       (as-> ?pstate ?ps
@@ -389,7 +380,8 @@
       ?pstate)
     (assoc ?pstate :result (->Factor (-> ?pstate :local first :symbol-number)
                                      (-> ?pstate :local first :subscript)
-                                     (-> ?pstate :local first :superscript)))))
+                                     (-> ?pstate :local first :superscript)
+                                     forder))))
 
 ;;; Primary == '(' expression ')' | math-op | annotated-exp  
 (defparse :primary
@@ -498,8 +490,6 @@
 
 (defmulti math2owl #'math2owl-dispatch)
 
-(def +term-order+ (atom 0))
-(def +factor-order+ (atom 0))
 (def +triples+ (atom []))
 
 (defn- add-triples
@@ -515,8 +505,6 @@
 ;;; (defrecord MathExp [content])
 (defmethod math2owl MathExp
   [elem & {:keys []}]
-  (reset! +term-order+ 0)
-  (reset! +factor-order+ 0)
   (reset! +triples+ [])
   (math2owl (:content elem) :subj :realURI)
   @+triples+)
@@ -539,13 +527,10 @@
         term (math2owl (:term elem))]
     (add-triples
      [subj :rdf:type :Expression]
-     [subj :hasTerm term]
-     [term :rdf:type :Term]
-     [term :hasPosition 
-      {:value (str (swap! +term-order+ inc)) :type :xsd:nonNegativeInteger}]) 
+     [subj :hasTerm term]) 
     (when-let [op (:op elem)]
       (let [op (math2owl op)]
-        (add-triples [op :hasLeftTerm term])
+        (add-triples [subj op term])
         (math2owl (:exp elem) :subj subj)))
     subj))
 
@@ -564,16 +549,16 @@
 (defmethod math2owl Term 
   [elem & {:keys []}]
   (let [term (new-blank-node "term")]
-    (add-triples [term :rdf:type :Term])
+    (add-triples [term :rdf:type :Term]
+                 [term :hasTermOrder {:value (:order elem) :type :xsd:nonNegativeInteger}])
     (when-let [uop (:unary-op elem)]
       (add-triples [term :hasUnaryOp (math2owl uop)]))
-    (reset! +factor-order+ 0)
     (doseq [f (:factors elem)]
       (let [fname (math2owl f :subj term)]
         (add-triples [term :hasFactor fname]
                      [fname :rdf:type :Factor]
-                     [fname :hasPosition 
-                      {:value (str (swap! +factor-order+ inc)) :type :xsd:nonNegativeInteger}])))
+                     [fname :hasFactorOrder
+                      {:value (:order f) :type :xsd:nonNegativeInteger}])))
     term))
 
 ;;; (defrecord Factor [symbol-number subscript superscript])
@@ -581,8 +566,7 @@
   [elem & {:keys [subj]}]
   (let [factor (new-blank-node "factor")
         vname  (math2owl (:symbol-number elem) :subj factor)]
-    (add-triples [subj :hasFactor factor]
-                 [factor :hasSymbol vname])
+    (add-triples [subj :hasFactor factor])
     (when-let [sub (:subscript     elem)] (add-triples [vname :hasSubscript   (math2owl sub :subj factor)]))
     (if (number? (:name (:symbol-number elem)))
       (when-let [sup (:superscript   elem)] (add-triples [vname :hasExponent (math2owl sup :subj factor)]))
@@ -597,9 +581,9 @@
       (add-triples [subj :hasValue sym]
                    [sym :rdf:type :LiteralNumber]
                    [sym :hasValue {:value (:name elem) :type :xsd:decimal}])
-        (add-triples [subj :hasVariable sym]
-                     [sym :rdf:type :Variable]
-                     [sym :hasName {:value (:name elem) :type :xsd:string}]))
+      (add-triples [subj :hasVariable sym]
+                   [sym :rdf:type :Variable]
+                   [sym :hasName {:value (:name elem) :type :xsd:string}]))
     sym))
 
 (defmethod math2owl Fraction
@@ -665,5 +649,3 @@
 (def i9 "$\\bar{x}$")
 (def i10 "$ x = \\frac{1}{2}$")
 (def i11 "$t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}$") ; POD fix this so Vf works. (Need hints from table). 
-    
-
