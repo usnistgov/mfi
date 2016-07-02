@@ -1,9 +1,9 @@
 (ns gov.nist.mfi-test
   (:require [clojure.test :refer :all]
-            [edn-ld.core :refer :all] 
+            [edn-ld.core :refer :all]
             [edn-ld.common :refer :all]
             [edn-ld.jena :refer :all]
-            [gov.nist.mfi :refer :all as mfi])
+            [gov.nist.mfi :refer :all :as mfi])
   (:import (java.io StringReader StringWriter)
            (com.hp.hpl.jena.graph Node_URI Node_Blank Node_Literal)
            (com.hp.hpl.jena.sparql.core Quad)
@@ -11,7 +11,8 @@
            (com.hp.hpl.jena.rdf.model ModelFactory AnonId)
            (com.hp.hpl.jena.query DatasetFactory)
            (com.hp.hpl.jena.datatypes BaseDatatype)
-           (org.apache.jena.riot RDFDataMgr RDFLanguages)))
+           (org.apache.jena.riot RDFDataMgr RDFLanguages)
+           (gov.nist.mfi MathExp)))
 
 (def input1 "$Y = \\beta_0$ ")
 (def input2 "$Y = \\beta_1X_1$")
@@ -23,16 +24,16 @@
 (def input8 "$\\frac{1}{2}$")
 (def input9 "$\\bar{x}$")
 (def input10 "$ x = \\frac{1}{2}$")
-(def input11 "$t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}$") 
+(def input11 "$t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}$")
             
 (defn- simple-test
   [input]
   (let [result (->> input
-                    (preprocess-math)
-                    (parse :math))]
+                    (mfi/preprocess-math)
+                    (mfi/parse :math))]
     (when-let [result (or (:error result) (:math result))]
       (->> result
-           ((if (= (type result) gov.nist.mfi.MathExp) math2owl error2owl))
+           ((if (= (type result) MathExp) math2owl error2owl))
            (map #(edn-ld.core/expand-all context+ %))
            (edn-ld.jena/write-triple-string prefixes)) ; Not used, but I'm interested in problems here.
       @+triples+)))

@@ -153,7 +153,7 @@
    (as-> pstate ?pstate
      (loop [cnt (- n (count (:peek-lexemes ?pstate)))
             ps ?pstate]
-       (if (> cnt 0)
+       (if (pos? cnt)
          (let [lex (token-from-stream (:char-stream ps))]
            (recur (dec cnt)
                   (-> ps
@@ -176,10 +176,20 @@
   "Read a token and check that it is what was expected."
   [pstate tkn]
   (as-> pstate ?pstate
-   (peek-token ?pstate)
-   (if (= tkn (:peek ?pstate))
-     (read-token ?pstate)
-     (assoc ?pstate :error (str "expected: " tkn " got: " (:tkn pstate))))))
+    (peek-token ?pstate)
+    (if (= tkn (:peek ?pstate))
+      (read-token ?pstate)
+      (assoc ?pstate :error (str "expected: " tkn " got: " (:tkn pstate))))))
+
+(defn- assert-LaTeX
+  "Read a token and check that it is what was expected."
+  [pstate tkn]
+  (as-> pstate ?pstate
+    (peek-token ?pstate)
+    (if (and (= (type (:peek ?pstate)) LaTeX)
+             (= (:name (:peek ?pstate)) tkn))
+      (read-token ?pstate)
+      (assoc ?pstate :error (str "expected LaTeX: " tkn " got: " (:tkn pstate))))))
 
 ;;; ============ Parser (doesn't care about lexemes, just :tkn and :peek)  =============
 ;(remove-all-methods parse)
@@ -292,28 +302,6 @@
     (assoc ?pstate :result (->Fraction (-> ?pstate :local first :numerator)
                                        (-> ?pstate :local first :denominator)))))
 
-(defrecord AnnotatedExp [exp annotation])
-
-(defparse :annotated-exp
-  [pstate]
-  (as-> pstate ?pstate
-    (read-token ?pstate)
-    (assoc-in ?pstate [:local 0 :annotation] (:tkn ?pstate))
-    (parse :latex-arg ?pstate)
-    (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
-    (assoc ?pstate :result (->AnnotatedExp (-> ?pstate :local first :exp)
-                                           (-> ?pstate :local first :annotation)))))
-
-;;; latex-arg == '{' expression '}'
-(defparse :latex-arg
-  [pstate]
-  (as-> pstate ?pstate
-    (assert-token ?pstate \{)
-    (parse :expression ?pstate)
-    (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
-    (assert-token ?pstate \})
-    (assoc ?pstate :result (-> ?pstate :local first :exp))))
-
 (defn- unary-op?
   [tkn]
   (= tkn \-))
@@ -350,8 +338,8 @@
 
 (defrecord Factor [symbol-number subscript superscript order])
 
-;;; factor ==   symbol-number ( (subscript (superscript)?)? | (superscript (subscript)?)? )
-;;;           | primary       ( (subscript (superscript)?)? | (superscript (subscript)?)? )
+;;; factor ==   symbol-number subsuper
+;;;           | primary       subsuper
 (defparse :factor  
   [pstate & {:keys [forder]}]
   (as-> pstate ?pstate
@@ -362,26 +350,33 @@
       (as-> ?pstate ?ps
         (parse :symbol-number ?ps)
         (assoc-in ?ps [:local 0 :symbol-number] (:result ?ps))))
-    (peek-token ?pstate)
-    (if (#{\_ \^} (:peek ?pstate))
-      (loop [ps ?pstate
-             cnt 2]
-        (if (and (> cnt 0) (#{\_ \^} (:peek ps)))
-          (as-> ps ?ps
-            (if (= (:peek ?ps) \_)
-              (as-> ?ps ?ps1
-                (parse :subscript ?ps1)
-                (assoc-in ?ps1 [:local 0 :subscript] (:result ?ps1)))
-              (as-> ?ps ?ps1
-                (parse :superscript ?ps1)
-                (assoc-in ?ps1 [:local 0 :superscript] (:result ?ps1))))
-            (recur (peek-token ?ps) (dec cnt)))
-          ps))
-      ?pstate)
+    (parse :subsupers ?pstate)
     (assoc ?pstate :result (->Factor (-> ?pstate :local first :symbol-number)
-                                     (-> ?pstate :local first :subscript)
-                                     (-> ?pstate :local first :superscript)
+                                     (-> ?pstate :result :subscript)
+                                     (-> ?pstate :result :superscript)
                                      forder))))
+
+;;; subsupers == ( (subscript (superscript)?)? | (superscript (subscript)?)? )
+;;;              ( (subscript (superscript)?)? | (superscript (subscript)?)? )
+(defparse :subsupers
+  [pstate]
+  (as-> pstate ?pstate
+    (peek-token ?pstate)
+    (loop [ps ?pstate
+           cnt 2]
+      (if (and (pos? cnt) (#{\_ \^} (:peek ps)))
+        (as-> ps ?ps
+          (if (= (:peek ?ps) \_)
+            (as-> ?ps ?ps1
+              (parse :subscript ?ps1)
+              (assoc-in ?ps1 [:local 0 :subscript] (:result ?ps1)))
+            (as-> ?ps ?ps1
+              (parse :superscript ?ps1)
+              (assoc-in ?ps1 [:local 0 :superscript] (:result ?ps1))))
+          (recur (peek-token ?ps) (dec cnt)))
+          ps))
+    (assoc ?pstate :result {:subscript   (-> ?pstate :local first :subscript)
+                            :superscript (-> ?pstate :local first :superscript)})))
 
 ;;; Primary == '(' expression ')' | math-op | annotated-exp  
 (defparse :primary
@@ -409,8 +404,55 @@
           (assoc ?pstate :result (:tkn ?pstate)),
           (number? (:tkn ?pstate))
           (assoc ?pstate :result (map->Symbol {:name (:tkn ?pstate) :greek? false})),
-          true 
+          :default
           (assoc ?pstate :error {:expected "symbol or number" :got (:tkn ?pstate)}))))
+
+
+;;; sum == \sum ( \limits lower-limit ? upper-limit ?)? body
+(defrecord Sum [body lower upper])
+
+(defparse :sum
+  [pstate]
+  (as-> pstate ?pstate
+    (assert-LaTeX ?pstate "sum")
+    (peek-token ?pstate)
+    (if (and (= (type (:peek ?pstate)) LaTeX)
+             (= (:name (:peek ?pstate)) "limits"))
+      (as-> ?pstate ?ps
+        (read-token ?ps)
+        (peek-token ?ps)
+        (parse :subsupers ?ps)
+        (update-in ?ps [:local 0 :lowerlimit] (:subscript (:result ?ps)))
+        (update-in ?ps [:local 0 :upperlimit] (:superscript (:result ?ps))))
+      ?pstate)
+    (parse :expression)
+    (assoc ?pstate :result (->Sum (:result ?pstate)
+                                  (-> :local first :lowerlimit)
+                                  (-> :local first :upperlimit)))))
+
+(defrecord AnnotatedExp [exp annotation])
+
+(defparse :annotated-exp
+  [pstate]
+  (as-> pstate ?pstate
+    (read-token ?pstate)
+    (assoc-in ?pstate [:local 0 :annotation] (:tkn ?pstate))
+    (parse :latex-arg ?pstate)
+    (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
+    (assoc ?pstate :result (->AnnotatedExp (-> ?pstate :local first :exp)
+                                           (-> ?pstate :local first :annotation)))))
+
+;;; latex-arg == '{' expression '}'
+(defparse :latex-arg
+  [pstate]
+  (as-> pstate ?pstate
+    (assert-token ?pstate \{)
+    (parse :expression ?pstate)
+    (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
+    (assert-token ?pstate \})
+    (assoc ?pstate :result (-> ?pstate :local first :exp))))
+
+
       
 (defrecord Subscript [exp])
 (defrecord Superscript [exp])
@@ -649,3 +691,7 @@
 (def i9 "$\\bar{x}$")
 (def i10 "$ x = \\frac{1}{2}$")
 (def i11 "$t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}$") ; POD fix this so Vf works. (Need hints from table). 
+(def i12 "$T_n = \\sum\\limits_{i=1}^n t_{ci}$")
+
+{:foo nil :bar true :foobar "" :metoo false}
+        
