@@ -50,4 +50,6 @@
     (is (= 33  (count (simple-test input8))))
     (is (= 22  (count (simple-test input9))))
     (is (= 48  (count (simple-test input10))))
-    (is (= 99  (count (simple-test input11))))))
+    (is (= 99  (count (simple-test input11))))
+    (is (= 21  (count (simple-test input12))))
+    (is (= 45  (count (simple-test input13))))))
