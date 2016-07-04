@@ -21,9 +21,7 @@
 ;;; This seems a little weird at times, but it really does make debugging easier. 
 
 ;;; ToDo:
-;;;       - Read the whole text to tokens. (Does this simplify anything?)
 ;;;       - Simplify expression with cutoff. Go back and fix the subscripts and superscripts to just use expression.
-;;;       - simpler gather-whitespace
 ;;;       - Consider a rewrite that uses clojure.spec. (Is that feasible?)
 ;;;       - Write results to in-memory jena.
 
@@ -33,173 +31,131 @@
 ;;; POD As written pstate really has to be a variable! (Otherwise will need to substitute in @body tree.)
 (defmacro ^:private defparse [tag [pstate & keys-form] & body]
   `(defmethod parse ~tag [~'tag ~pstate ~@(or keys-form '(& ignore))]
+     (println ~tag)
      (as-> ~pstate ~pstate
        (reset! +debug+ (update-in ~pstate [:tags] conj ~tag))
        (update-in ~pstate [:local] #(into [{}] %))
-       (if (:error ~pstate) 
-         (as-> ~pstate ~pstate ; Stop things, saving stream for debugging. 
-           (assoc ~pstate :debug-stream (:char-stream ~pstate))
-           (assoc ~pstate :char-stream "")
-           (assoc ~pstate :tkn :eof))
+       (if (:error ~pstate) ; Stop things
+         (assoc ~pstate :tkn :eof)
          (as-> ~pstate ~pstate
            ~@body))
        (reset! +debug+ (update-in ~pstate [:tags] pop))
        (update-in ~pstate [:local] #(vec (rest %))))))
 
 ;;; ============ Lexer ===============================================================
-(defn- gather-whitesp ; POD this was borrowed from something that had /* */ comments. Overkill!
-  "Gather whitespace at head, returning it; don't touch pstate."
+(defn- whitesp 
+  "Evaluates to whitespace at head of string or empty string if none."
   [s]
-  (let [r (atom "")
-        p (atom 0) 
-        l (count s)]
-    (if (empty? s) 
-      ""
-      (while (and (> l (inc @p))
-                  (or (#{\space \newline \return \tab \formfeed} (nth s @p))
-                      (= "/*" (subs s @p (+ @p 2)))
-                      (= "//" (subs s @p (+ @p 2)))))
-        (cond (#{\space \newline \return \tab \formfeed} (nth s @p))
-              (loop [n @p]
-                (when (#{\space \newline \return \tab \formfeed} (nth s n))
-                  (swap! p inc)
-                  (swap! r str (nth s n))
-                  (recur (inc n)))),
-              (= "/*" (subs s @p (+ @p 2)))
-              (do (swap! r str (nth s @p))           (swap! p inc)
-                  (swap! r str (nth s @p))           (swap! p inc)
-                  (loop [i @p]
-                    (if (and (= (get s @p) \*) (= (get s (inc @p)) \/))
-                      (do (swap! r str (nth s @p))   (swap! p inc)
-                          (swap! r str (nth s @p))   (swap! p inc))
-                      (do (swap! r str (nth s @p))   (swap! p inc)
-                          (recur (inc i)))))),
-              (= "//" (subs s @p (+ @p 2)))
-              (do (swap! r str (nth s @p))           (swap! p inc)
-                  (swap! r str (nth s @p))           (swap! p inc)
-                  (loop [i @p]
-                    (swap! r str (nth s @p))         (swap! p inc) 
-                    (when (not= \return (nth s (dec @p)))
-                      (recur (inc i))))))))
-    @r))
+  (if s (or (nth (re-matches #"(?m)(\s+).*$" s) 1) "") ""))
 
 (def greek-alphabet
   ^:private
   #{"alpha" "beta" "gamma" "delta" "epsilon" "zeta" "eta" "theta" "iota" "kappa" "lambda" "mu"
     "Alpha" "Beta" "Gamma" "Delta" "Epsilon" "Zeta" "Eta" "Theta" "Iota" "Kappa" "Lambda" "Mu"
     "nu" "xi" "omnicron" "pi" "rho" "sigma" "tau" "upsilon" "phi" "chi" "psi" "omega"
-    "Nu" "Xi" "Omnicron" "Pi" "Rho" "Sigma" "Tau" "Upsilon" "Phi" "Chi" "Psi" "Omega"})
+    "Nu" "Xi" "Omnicron" "Pi" "Rho" "Sigma" "Tau" "Upsilon" "Phi" "Chi" "Psi" "Omega"
+    "varepsilon" "vartheta" "varkappa" "varrho" "varsigma" "varphi"})
 
+;;; POD lots more to come, https://oeis.org/wiki/List_of_LaTeX_mathematical_symbols
 (def math-op
   ^:private
-  #{"sum" "frac" "nabla"})
+  #{"frac" "int" "sum" "prod" "nabla"})
 
 (def math-annotation
   ^:private
-  #{"bar" "limits"})
+  #{"bar" "hat" "limits"}) ; POD "limits" ought to be one of a new 'math-args'
 
-(def math-rel-op ; POD lots more to come, https://oeis.org/wiki/List_of_LaTeX_mathematical_symbols
+(def math-rel-op 
   ^:private
-  #{"neq"  "lt" "gt" "le" "leq" "geq" "nless" "ngtr" "ngeq" "subset" "subseteq"})
+    #{"neq"  "lt" "gt" "le" "leq" "geq" "nless" "ngtr" "ngeq" "subset" "subseteq"
+      "leqslant" "nleq" "nleqslant" "prec" "preceq" "npreceq" "ll" "lll" "nsubseteq"
+      "sqsubset" "sqsubseteq" "qeq" "qeqslant"  "ngeqslant" "succ" "nsucc" "succeq"
+      "nsucceq" "gg" "ggg" "supset" "supseteq" "nsupseteq" "sqsupset" "sqsupseteq"
+      "doteq" "equiv" "approx" "cong" "simeq" "sim" "propto" "ne"})
 
 (def latex-any
   ^:private
   (set (concat math-op math-annotation math-rel-op)))
 
 (defrecord Symbol [name greek?])  ; alphabetic symbols and latex greek letters. 
-(defrecord LaTeX [name])          ; thing starting with \ other than greek letters. 
-(defrecord Lexeme [raw ws token]) ; container for Symbol/Latex and other info.
+(defrecord LaTeX [name])          ; thing starting with \ other than greek letters.
+(defrecord LaTeXRelOp [name])
 
-(defn- token-from-stream
+(defn LaTeX? [x] (or (instance? LaTeX x) (instance? LaTeXRelOp x)))
+(defn LaTeXRelOp? [x] (instance? LaTeXRelOp x))
+
+(defn- token-from-string
   "Return a token object from the argument 'stream' (a string)."
   [stream]
-  (let [ws (gather-whitesp stream)
+  (let [ws (whitesp stream)
         s (subs stream (count ws))
         c (first s)]
-    (or (and (empty? s) (map->Lexeme {:ws ws :token :eof}))
-        (and (= :eof c) (map->Lexeme {:ws ws :token :eof}))
-        (and (#{\{, \}, \_, \^, \+, \-, \=, \<, \>, \(, \)} c)  (map->Lexeme {:ws ws :raw (str c) :token c}))
+    (or (and (empty? s) {:ws ws :raw "" :tkn :eof})
+        (and (#{\{, \}, \_, \^, \(, \)} c) {:ws ws :raw (str c) :tkn c})
+        (when-let [op ({\= "eq", \< "lt", \>, "gt"} c)]
+          {:ws ws :raw (str c) :tkn (->LaTeXRelOp op)})
         (when-let [[_ num] (re-matches #"^([+-]?\d+\.?\d*(e[+-]?\d+)?).*" s)]
-          (map->Lexeme {:ws ws :raw num :token (read-string num)})),
+          {:ws ws :raw num :tkn (read-string num)}),
+        (and (#{\+, \-} c) {:ws ws :raw (str c) :tkn c})
         (when-let [[_ esc symbol] (re-matches #"^(\\?)([a-zA-Z\,]+).*" s)] ; POD I added comma here. Example "c,i" Do I care?
-          (map->Lexeme {:ws ws :raw (str esc symbol)
-                        :token
-                        (if (and esc (latex-any symbol))
-                          (->LaTeX symbol)
-                          (->Symbol symbol (and esc (greek-alphabet symbol))))}))
-        {:error "Char starts no known token: " :raw (str c)}))) 
+          {:ws ws :raw (str esc symbol)
+           :tkn
+           (cond (and esc (math-rel-op symbol)) (->LaTeXRelOp symbol),
+                 (and esc (latex-any symbol))   (->LaTeX symbol),
+                 :default
+                 (->Symbol symbol (and esc (greek-alphabet symbol))))})
+        (throw (ex-info "Char starts no known token: " {:raw c})))))
 
-(defn- check-for-errors
-  [pstate lex]
-  (if-let [err (:error lex)]
-    (assoc pstate :error (:error lex))
-    pstate))
+;;; When done, get rid of Lexeme!
+(defn tokenize
+  "Return a list of tokens"
+  [stream]
+  (loop [s stream
+         tkns []]
+    (let [lex (token-from-string s)]
+      (if (= :eof (:tkn lex))
+        (conj tkns :eof)
+        (recur
+         (subs s (+ (count (:raw lex)) (count (:ws lex))))
+         (conj tkns (:tkn lex)))))))
 
 (defn- read-token
-  "Consume a token, either from peek or the real stream."
+  "Consume a token, setting :tkn."
   [pstate]
-  (if-let [plex (first (:peek-lexemes pstate))]
-    (as-> pstate ?pstate
-      (assoc ?pstate :lex plex)
-      (assoc ?pstate :tkn (:token plex))
-      (update-in ?pstate [:peek-lexemes] #(vec (rest %)))
-      (assoc ?pstate :peek-lex (first (:peek-lexemes ?pstate)))
-      (assoc ?pstate :peek (:token (:peek-lex ?pstate))))
-    (let [lex (token-from-stream (:char-stream pstate))]
-      (-> pstate
-          (check-for-errors lex)
-          (assoc :lex lex)
-          (assoc :tkn (:token lex))
-          (update-in [:char-stream] subs (+ (count (:raw lex)) (count (:ws lex))))))))
-
-(defn- peek-token
-  "Return pstate with :peek-lex :peek and peek-lexemes set."
-  ([pstate] (peek-token pstate 1))
-  ([pstate n]
-   (as-> pstate ?pstate
-     (loop [cnt (- n (count (:peek-lexemes ?pstate)))
-            ps ?pstate]
-       (if (pos? cnt)
-         (let [lex (token-from-stream (:char-stream ps))]
-           (recur (dec cnt)
-                  (-> ps
-                      (check-for-errors lex)
-                      (update-in [:accum-str] str (:ws lex) (:raw lex)) 
-                      (update-in [:char-stream] subs (+ (count (:raw lex)) (count (:ws lex))))
-                      (update-in [:peek-lexemes] conj lex))))
-         ps))
-     (assoc ?pstate :peek-lex (nth (:peek-lexemes ?pstate) (dec n) nil))
-     (assoc ?pstate :peek (:token (:peek-lex ?pstate))))))
+  (-> pstate 
+      (assoc :tkn (or (first (:tokens pstate)) :eof))
+      (assoc :tokens (rest (:tokens pstate)))))
 
 (defn look
   "Returns a token, not the pstate."
   ([pstate]
    (look pstate 1))
   ([pstate n]
-   (as-> pstate ?pstate
-     (peek-token ?pstate n)
-     (:token (nth (:peek-lexemes ?pstate) (dec n))))))
+   (if (> n (count (:tokens pstate)))
+     :eof
+     (nth (:tokens pstate) (dec n)))))
 
 (defn- assert-token
   "Read a token and check that it is what was expected."
   [pstate tkn]
   (as-> pstate ?pstate
-    (peek-token ?pstate)
-    (if (= tkn (:peek ?pstate))
+    (if (= tkn (look ?pstate))
       (read-token ?pstate)
-      (assoc ?pstate :error (str "expected: " tkn " got: " (:tkn pstate))))))
+      (as-> ?pstate ?ps
+        (assoc ?ps :error (str "expected: " tkn " got: " (:tkn ?ps)))
+        (assoc ?ps :debug-tokens (:tokens ?ps))
+        (assoc ?ps :tokens [])))))
 
 (defn- assert-LaTeX
   "Read a token and check that it is what was expected."
   [pstate tkn]
   (as-> pstate ?pstate
-    (peek-token ?pstate)
-    (if (and (= (type (:peek ?pstate)) LaTeX)
-             (= (:name (:peek ?pstate)) tkn))
+    (if (and (LaTeX? (look ?pstate))
+             (= (:name (look ?pstate)) tkn))
       (read-token ?pstate)
       (assoc ?pstate :error (str "expected LaTeX: " tkn " got: " (:tkn pstate))))))
 
-;;; ============ Parser (doesn't care about lexemes, just :tkn and :peek)  =============
+;;; ============ Parser =============
 ;(remove-all-methods parse)
 ;(ns-unmap *ns* 'parse)
 
@@ -207,16 +163,12 @@
 
 (defmulti parse #'parse-dispatch)
 
-(defn- relation-token-p [tkn]
-  (contains? [\= :lt :le :gt :ge] tkn))
-
 ;;; math == relation | expression
 (defparse :math
   [pstate]
   (as-> pstate ?pstate 
     (parse :expression ?pstate)
-    (peek-token ?pstate)
-    (if (= :eof (:peek ?pstate))
+    (if (= :eof (look ?pstate))
       (assoc ?pstate :math (->MathExp (:result ?pstate)))
       (as-> ?pstate ?ps
         (parse :relation ?ps :lhs (:result ?ps))
@@ -236,21 +188,20 @@
     (parse :rel-op ?pstate)
     (assoc-in ?pstate [:local 0 :rel-op] (:result ?pstate))
     (parse :expression ?pstate)
-    (assoc-in ?pstate [:local 0 :rhs]  (:result ?pstate))
+    (assoc-in ?pstate [:local 0 :rhs] (:result ?pstate))
     (assoc ?pstate :result
            (->Relation (-> ?pstate :local first :lhs)
                        (-> ?pstate :local first :rel-op)
                        (-> ?pstate :local first :rhs)))))
 
-;;; rel-op == = | > | < | :leq | :geq
+;;; rel-op == = | > | < | :leq | :geq, etc. (see math-rel-op)
 (defparse :rel-op
   [pstate]
   (as-> pstate ?pstate
-    (read-token ?pstate)
-    (let [tkn (get {\= :equal, \> :gt, \< :lt, :leq :leq, :geq :geq} (:tkn ?pstate) :error)]
-      (if (= tkn :error)
-        (assoc ?pstate :error {:expected "rel-op" :got (:tkn ?pstate)})
-        (assoc ?pstate :result tkn)))))
+    (read-token ?pstate) 
+    (if (LaTeXRelOp? (:tkn ?pstate))
+      (assoc ?pstate :result (:tkn ?pstate))
+      (assoc ?pstate :error {:expected "rel-op" :got (:tkn ?pstate)}))))
           
 (defn- add-op-p [tkn]
   (#{\+ \-} tkn))
@@ -266,33 +217,43 @@
 
 (defrecord Expression [term op exp])
 
-;;; expression == ( term [add-op expression]+ ) | primary
+;;; expression == ( term [add-op expression]+ ) | symbol-number
+;;; Note: allowing symbol-number here is a short-cut for simple expressions.
 (defparse :expression
   [pstate & {:keys [torder] :or {torder 1}}]
-  (peek-token pstate 2)
-  (as-> pstate ?pstate
-    (parse :term ?pstate :torder torder)
-    (assoc-in ?pstate [:local 0 :term] (:result ?pstate))
-    (peek-token ?pstate)
-    (if (add-op-p (:peek ?pstate))
-      (as-> ?pstate ?ps
-        (parse :add-op ?ps)
-        (assoc-in ?ps [:local 0 :add-op] (:result ?ps))
-        (parse :expression ?ps :torder (inc torder))
-        (assoc-in ?ps [:local 0 :expression] (:result ?ps)))
-      ?pstate)
-    (assoc ?pstate :result (->Expression (-> ?pstate :local first :term)
-                                         (-> ?pstate :local first :add-op)
-                                         (-> ?pstate :local first :expression)))))
+  (let [p1 (look pstate)
+        p2 (look pstate 2)
+        p3 (look pstate 3)]
+    (cond (and (or (number? p1) (instance? Symbol p1))
+               (or (LaTeXRelOp? p2) (= :eof p2)))
+          (parse :symbol-number pstate),
+          (and (or (number? p1) (instance? Symbol p1))
+               (#{\_ \^} p2)
+               (= :eof p3))
+          (parse :variable pstate),
+          :default
+          (as-> pstate ?pstate
+            (parse :term ?pstate :torder torder)
+            (assoc-in ?pstate [:local 0 :term] (:result ?pstate))
+            (if (add-op-p (look ?pstate))
+              (as-> ?pstate ?ps
+                (parse :add-op ?ps)
+                (assoc-in ?ps [:local 0 :add-op] (:result ?ps))
+                (parse :expression ?ps :torder (inc torder))
+                (assoc-in ?ps [:local 0 :expression] (:result ?ps)))
+              ?pstate)
+            (assoc ?pstate :result (->Expression (-> ?pstate :local first :term)
+                                                 (-> ?pstate :local first :add-op)
+                                                 (-> ?pstate :local first :expression)))))))
 
 ;;; math-op = frac | sum | integral
 (defparse :math-op
   [pstate]
-  (let [name (:name (:peek pstate))]
+  (let [name (:name (look pstate))]
     (cond (= "frac" name)
           (parse :frac pstate),
           (= "sum" name)
-          (parse :sum pstate), ; nyi
+          (parse :sum pstate), 
           (= "int" name)
           (parse :integral pstate)))) ; nyi
 
@@ -326,8 +287,7 @@
   [pstate & {:keys [torder]}]
   (as-> pstate ?pstate
     (assoc-in ?pstate [:local 0 :factors] [])
-    (peek-token ?pstate)
-    (if (unary-op? (:peek ?pstate))
+    (if (unary-op? (look ?pstate))
       (as-> ?pstate ?ps
         (parse :unary-op ?ps)
         (assoc-in ?ps [:local 0 :unary-op] (:result ?ps)))
@@ -336,8 +296,7 @@
            ps (parse :factor ?pstate :forder forder)]
       (as-> ps ?ps
         (update-in ?ps [:local 0 :factors] conj (:result ?ps))
-        (peek-token ?ps)
-        (if (not (#{\= \< \> \+ \- \} \) :eof} (:peek ?ps)))
+        (if (not (or (LaTeXRelOp? (look ?ps)) (#{\+ \- \} \) :eof} (look ?ps))))
           (recur (inc forder) (parse :factor ?ps :forder (inc forder)))
           ?ps)))
     (assoc ?pstate :result (->Term (-> ?pstate :local first :unary-op)
@@ -346,17 +305,17 @@
 
 (defrecord Factor [symbol-number subscript superscript order])
 
-;;; factor ==   symbol-number subsuper
+;;; factor ==   variable 
 ;;;           | primary       subsuper
 (defparse :factor  
   [pstate & {:keys [forder]}]
   (as-> pstate ?pstate
-    (if (or (= \( (:peek ?pstate)) (= LaTeX (type (:peek ?pstate))))
+    (if (or (= \( (look ?pstate)) (LaTeX? (look ?pstate)))
       (as-> ?pstate ?ps
         (parse :primary ?ps)
         (assoc-in ?ps [:local 0 :symbol-number] (:result ?ps)))
       (as-> ?pstate ?ps
-        (parse :symbol-number ?ps)
+        (parse :variable ?ps)
         (assoc-in ?ps [:local 0 :symbol-number] (:result ?ps))))
     (parse :subsupers ?pstate)
     (assoc ?pstate :result (->Factor (-> ?pstate :local first :symbol-number)
@@ -364,24 +323,39 @@
                                      (-> ?pstate :result :superscript)
                                      forder))))
 
+
+(defrecord Variable [symbol subscript superscript])
+;;; variable ==   symbol-number subsuper
+(defparse :variable  
+  [pstate & _]
+  (as-> pstate ?pstate
+    (parse :symbol-number ?pstate)
+    (assoc-in ?pstate [:local 0 :symbol-number] (:result ?pstate))
+    (parse :subsupers ?pstate)
+    (assoc ?pstate :result (->Variable (-> ?pstate :local first :symbol-number)
+                                       (-> ?pstate :result :subscript)
+                                       (-> ?pstate :result :superscript)))))
+
+
+
+
 ;;; subsupers == ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 ;;;              ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 (defparse :subsupers
   [pstate & {:keys [rel-ok?]}]
   (as-> pstate ?pstate
-    (peek-token ?pstate)
     (loop [ps ?pstate
            cnt 2]
-      (if (and (pos? cnt) (#{\_ \^} (:peek ps)))
+      (if (and (pos? cnt) (#{\_ \^} (look ps)))
         (as-> ps ?ps
-          (if (= (:peek ?ps) \_)
+          (if (= (look ?ps) \_)
             (as-> ?ps ?ps1
               (parse :subscript ?ps1 :rel-ok? rel-ok?)
               (assoc-in ?ps1 [:local 0 :subscript] (:result ?ps1)))
             (as-> ?ps ?ps1
               (parse :superscript ?ps1 :rel-ok? rel-ok?)
               (assoc-in ?ps1 [:local 0 :superscript] (:result ?ps1))))
-          (recur (peek-token ?ps) (dec cnt)))
+          (recur ?ps (dec cnt)))
           ps))
     (assoc ?pstate :result {:subscript   (-> ?pstate :local first :subscript)
                             :superscript (-> ?pstate :local first :superscript)})))
@@ -389,32 +363,30 @@
 ;;; Primary == '(' expression ')' | math-op | annotated-exp  
 (defparse :primary
   [pstate]
-  (peek-token pstate)
-  (cond (= (:peek pstate) \()
+  (cond (= (look pstate) \()
         (as-> pstate ?pstate
           (assert-token ?pstate \()
           (parse :expression ?pstate)
           (assoc-in ?pstate [:local 0 :exp] (:result ?pstate))
           (assert-token ?pstate \))
           (assoc ?pstate :result (-> ?pstate :local first :exp))),
-        (and (= LaTeX (type (:peek pstate)))
-             (math-op (:name (:peek pstate))))
+        (and (LaTeX? (look pstate))
+             (math-op (:name (look pstate))))
         (parse :math-op pstate),
-        (and (= LaTeX (type (:peek pstate)))
-             (math-annotation (:name (:peek pstate))))
+        (and (LaTeX? (look pstate))
+             (math-annotation (:name (look pstate))))
         (parse :annotated-exp pstate)))
 
 (defparse :symbol-number
   [pstate]
   (as-> pstate ?pstate
     (read-token ?pstate)
-    (cond (= Symbol (type (:tkn ?pstate)))
+    (cond (instance? Symbol (:tkn ?pstate))
           (assoc ?pstate :result (:tkn ?pstate)),
           (number? (:tkn ?pstate))
-          (assoc ?pstate :result (map->Symbol {:name (:tkn ?pstate) :greek? false})),
+          (assoc ?pstate :result (->Symbol (:tkn ?pstate) false)),
           :default
           (assoc ?pstate :error {:expected "symbol or number" :got (:tkn ?pstate)}))))
-
 
 ;;; sum == \sum ( \limits lower-limit ? upper-limit ?)? body
 (defrecord Sum [body lower upper])
@@ -423,12 +395,10 @@
   [pstate]
   (as-> pstate ?pstate
     (assert-LaTeX ?pstate "sum")
-    (peek-token ?pstate)
-    (if (and (= (type (:peek ?pstate)) LaTeX)
-             (= (:name (:peek ?pstate)) "limits"))
+    (if (and (LaTeX? (look ?pstate))
+             (= (:name (look ?pstate)) "limits"))
       (as-> ?pstate ?ps
         (read-token ?ps)
-        (peek-token ?ps)
         (parse :subsupers ?ps :rel-ok? true)
         (assoc-in ?ps [:local 0 :lowerlimit] (:subscript (:result ?ps)))
         (assoc-in ?ps [:local 0 :upperlimit] (:superscript (:result ?ps))))
@@ -464,89 +434,61 @@
   "Return true if position of token matching test x 
    is before position of token matching test y."
    [x-test y-test ps & {:keys [limit] :or {limit 10}}]
-   (as-> ps ?pstate
-     (peek-token ?pstate limit)
-     (loop [cnt limit
-            lexs (:peek-lexemes ?pstate)]
-       (let [tkn (:token (first lexs))]
-         (cond (not (pos? cnt)) false
-               (x-test tkn) true
-               (y-test tkn) false
-               :default
-               (recur (dec cnt) (rest lexs)))))))
+  (loop [cnt 1]
+    (let [tkn (look ps cnt)]
+      (cond (> cnt limit) false
+            (x-test tkn) true
+            (y-test tkn) false
+            :default
+            (recur (dec cnt))))))
 
 (defrecord Subscript [exp])
 (defrecord Superscript [exp])
-
-(defn- arg-is-rel?
-  "Evaluate to true if some relational symbol occurs before }"
-  [pstate]
-  (x-before-y #(or (#{\= \< \>} %)
-                   (and (= (type %) LaTeX)
-                        (math-rel-op (:name %))))
-              #(= % \})
-              pstate))
 
 ;;; subscript ==  _ expression | _ \{ expression \}
 (defparse :subscript
   [pstate & {:keys [rel-ok?]}]
   (as-> pstate ?pstate
     (assert-token ?pstate \_)
-    (cond (number? (look ?pstate))
-          (as-> ?pstate ?ps
-            (read-token ?ps)
-            (assoc ?ps :result (->Subscript (:tkn ?ps)))),
-          (= 1 (count (str (:name (look ?pstate))))) ; symbol of one letter!
-          (as-> ?pstate ?ps
-            (parse :symbol-number ?ps) ; FIX THIS I want cut the expression down to a single term ??? Maybe just check for subj in serialize??
-            (assoc ?ps :result (->Subscript (:result ?ps))))
-          (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
-          (as-> ?pstate ?ps
-            (assert-token ?ps \{)
-            (read-token ?ps)
-            (assoc ?ps :result (->Subscript (:tkn ?ps)))
-            (assert-token ?ps \})),
-          (= \{ (look ?pstate))
-          (as-> ?pstate ?ps
-            (assert-token ?ps \{)
-            (parse (if (and rel-ok? (arg-is-rel? ?ps)) :relation :expression) ?ps)
-            (assoc ?ps :result (->Subscript (:result ?ps)))
-            (assert-token ?ps \})))))
+    (if (= \{ (look ?pstate))
+      (as-> ?pstate ?ps
+        (assert-token ?ps \{)
+        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (assoc ?ps :result (->Subscript (:result ?ps)))
+        (assert-token ?ps \}))
+      (as-> ?pstate ?ps
+        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (assoc ?ps :result (->Subscript (:result ?ps)))))))
 
 ;;; superscript ==  ^ expression | ^ \{ expression \}
 (defparse :superscript
   [pstate & {:keys [rel-ok?]}]
   (as-> pstate ?pstate
     (assert-token ?pstate \^)
-    (cond (or (number? (look ?pstate)) (= 1 (count (str (:name (look ?pstate))))))
-          (as-> ?pstate ?ps
-            (read-token ?ps)
-            (assoc ?ps :result (->Superscript (:tkn ?ps)))),
-          (and (= \{ (look ?pstate)) (= \} (look ?pstate 3)))
-          (as-> ?pstate ?ps
-            (assert-token ?ps \{)
-            (read-token ?ps)
-            (assoc ?ps :result (->Superscript (:tkn ?ps)))
-            (assert-token ?ps \}))
-          (= \{ (look ?pstate))
-          (as-> ?pstate ?ps
-            (assert-token ?ps \{)
-            (parse (if (and rel-ok? (arg-is-rel? ?ps)) :relation :expression) ?ps)
-            (assoc ?ps :result (->Superscript (:result ?ps)))
-            (assert-token ?ps \})))))
+    (if (= \{ (look ?pstate))
+      (as-> ?pstate ?ps
+        (assert-token ?ps \{)
+        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (assoc ?ps :result (->Superscript (:result ?ps)))
+        (assert-token ?ps \}))
+      (as-> ?pstate ?ps
+        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (assoc ?ps :result (->Superscript (:result ?ps)))))))
 
 (defn preprocess-math 
   "Remove the outermost delimiters ($ or $$) from the expression, EXP."
-  [exp]
-  (let [[_ d1 math d2] (re-matches #"^\s*(\$+)(.+)(\1)\s*$" exp)
-        math (and math (str/trim math))]
-    (if (or (not d1) (not d2) (not= d1 d2) (= \$ (first math)) (= \$ (last math)))
-      {:error "The input math expression must start with $ and end with $, or start with $$ and end with $$."}
-      {:char-stream math
-       :peek-lexemes []
+  [s]
+;;;  (let [[_ d1 math d2] (re-matches #"^\s*(\$+)(.+)(\1)\s*$" s)
+;;;        s (and s (str/trim s))]
+;;;    (if (or (not d1) (not d2) (not= d1 d2) (= \$ (first s)) (= \$ (last s)))
+;;;      {:error "The input math expression must start with $ and end with $, or start with $$ and end with $$."}
+  (let [tstream (tokenize s)]
+    (let [tokens (tokenize s)]
+      (if (pos? (.indexOf tokens nil))
+        (throw (ex-info "String did not tokenize correctly." {:tokens tokens})))
+      {:tokens tokens
        :tags []
-       :local []
-       :accum-str ""})))
+       :local []})))
 
 ;;;============= Conversion to OWL/Turtle ========================================
 (defn new-blank-node  
@@ -564,7 +506,7 @@
 
 (defn- add-triples
   [& trips]
-  (swap! +triples+ into trips)
+  (swap! +triples+ into (remove nil? trips))
   (count @+triples+)) ; POD diagnostic
 
 (def context {:mfi "http://modelmeth.nist.gov/mfi/", nil :mfi}) ; I thought (expand context nil) would give me same as :mfi. Nope. 
@@ -573,91 +515,118 @@
 
 ;;;; This is top-level of the translation.
 (defmethod math2owl MathExp
-  [elem & {:keys []}]
+  [elem & _]
   (reset! +triples+ [])
-  (math2owl (:content elem) :subj :realURI)
+  (add-triples [:realURI :rdf:type :MathContent])
+  (math2owl (:content elem) :parent :realURI)
   @+triples+)
 
 (defmethod math2owl Relation
-  [elem & {:keys [subj]}]
-  (if (:rel elem)
-    (add-triples [subj :rdf:type :Relation]
-                 [subj :hasLHS (math2owl (:lhs elem))]
-                 [subj :hasRelationalOp (math2owl (:rel elem))]
-                 [subj :hasRHS (math2owl (:rhs elem))])
-    (do (add-triples [subj :rdf:type :Expression])
-        (math2owl (:lhs elem) :subj subj)))
-  subj)
+  [elem & {:keys [parent]}]
+  (let [rel (new-blank-node "rel")]
+    (add-triples (when parent [parent :hasRelation rel])
+                 [rel :rdf:type :Relation]
+                 [rel :hasLHS (math2owl (:lhs elem))]
+                 [rel :hasRelationalOp (math2owl (:rel elem))]
+                 [rel :hasRHS (math2owl (:rhs elem))])
+    rel))
 
 (defmethod math2owl Expression
-  [elem & {:keys [subj]}]
-  (let [subj (or subj (new-blank-node "exp"))
+  [elem & {:keys [parent]}]
+  (let [exp (new-blank-node "exp")
         term (math2owl (:term elem))]
     (add-triples
-     [subj :rdf:type :Expression]
-     [subj :hasTerm term]) 
+     (when parent [parent :hasExpression exp])
+     [exp :rdf:type :Expression]
+     [exp :hasTerm term]) 
     (when-let [op (:op elem)]
       (let [op (math2owl op)]
-        (add-triples [subj op term])
-        (math2owl (:exp elem) :subj subj)))
-    subj))
+        (add-triples [exp op term])
+        (math2owl (:exp elem) :parent exp)))
+    exp))
 
 (defmethod math2owl AnnotatedExp
-  [elem & {:keys [subj]}]
-  (let [subj (or subj (new-blank-node "aexp"))
+  [elem & {:keys [parent]}]
+  (let [aexp (new-blank-node "aexp")
         exp (math2owl (:exp elem))]
-    (add-triples
-     [subj :rdf:type :AnnotatedExpression]
-     [subj :hasExpression exp]
-     [subj :hasAnnotation {:value (:name (:annotation elem)) :type :xsd:string}])
-    subj))
+  (add-triples
+   (when parent [parent :hasAnnotationExp exp])
+   [aexp :rdf:type :AnnotatedExpression]
+   [aexp :hasExpression exp]
+   [aexp :hasAnnotation {:value (:name (:annotation elem)) :type :xsd:string}])
+  aexp))
 
 (defmethod math2owl Term 
-  [elem & {:keys []}]
+  [elem & {:keys [parent]}]
   (let [term (new-blank-node "term")]
-    (add-triples [term :rdf:type :Term]
+    (add-triples (when parent [parent :hasTerm term])
+                 [term :rdf:type :Term]
                  [term :hasTermOrder {:value (:order elem) :type :xsd:nonNegativeInteger}])
     (when-let [uop (:unary-op elem)]
       (add-triples [term :hasUnaryOp (math2owl uop)]))
     (doseq [f (:factors elem)]
-      (let [fname (math2owl f :subj term)]
+      (let [fname (math2owl f :parent term)]
         (add-triples [fname :rdf:type :Factor]
                      [fname :hasFactorOrder
                       {:value (:order f) :type :xsd:nonNegativeInteger}])))
     term))
 
 (defmethod math2owl Factor
-  [elem & {:keys [subj]}]
+  [elem & {:keys [parent]}]
   (let [factor (new-blank-node "factor")
-        vname  (math2owl (:symbol-number elem) :subj factor)]
-    (add-triples [subj :hasFactor factor])
-    (when-let [sub (:subscript     elem)] (add-triples [vname :hasSubscript   (math2owl sub :subj factor)]))
+        vname  (math2owl (:symbol-number elem) :parent factor)]
+    (when parent (add-triples [parent :hasFactor factor]))
+    (when-let [sub (:subscript     elem)] (add-triples [vname :hasSubscript   (math2owl sub :parent factor)]))
     (if (number? (:name (:symbol-number elem)))
-      (when-let [sup (:superscript   elem)] (add-triples [vname :hasExponent (math2owl sup :subj factor)]))
-      (when-let [sup (:superscript   elem)] (add-triples [vname :hasSuperscript (math2owl sup :subj factor)])))
+      (when-let [sup (:superscript   elem)] (add-triples [vname :hasExponent (math2owl sup :parent factor)]))
+      (when-let [sup (:superscript   elem)] (add-triples [vname :hasSuperscript (math2owl sup :parent factor)])))
     factor))
 
 (defmethod math2owl Symbol
-  [elem & {:keys [subj]}]
+  [elem & {:keys [parent]}]
   (let [sym (new-blank-node "sym")]
     (if (number? (:name elem))
-      (add-triples [subj :hasValue sym]
+      (add-triples (when parent [parent :hasValue sym])
                    [sym :rdf:type :LiteralNumber]
                    [sym :hasValue {:value (:name elem) :type :xsd:decimal}])
-      (add-triples [subj :hasVariable sym]
+      (add-triples (when parent [parent :hasVariable sym])
                    [sym :rdf:type :Variable]
                    [sym :hasName {:value (:name elem) :type :xsd:string}]))
     sym))
 
+(defmethod math2owl Variable
+  [elem & {:keys [parent]}]
+  (let [sym (new-blank-node "sym")]
+    (if (number? (:name (:symbol elem)))
+      (add-triples (when parent [parent :hasValue sym])
+                   [sym :rdf:type :LiteralNumber]
+                   [sym :hasValue {:value (:name (:symbol elem)) :type :xsd:decimal}])
+      (add-triples (when parent [parent :hasVariable sym])
+                   [sym :rdf:type :Variable]
+                   [sym :hasName {:value (:name (:symbol elem)) :type :xsd:string}]))
+    (when-let [sub (:subscript     elem)] (add-triples [sym :hasSubscript   (math2owl sub :parent sym)]))
+    (if (number? (:name (:symbol elem)))
+      (when-let [sup (:superscript   elem)] (add-triples [sym :hasExponent (math2owl sup :parent sym)]))
+      (when-let [sup (:superscript   elem)] (add-triples [sym :hasSuperscript (math2owl sup :parent sym)])))
+    sym))
+
+(defmethod math2owl LaTeXRelOp
+  [elem & _]
+  (keyword
+   (or (#{\+ "plus", \- "minus"} (:name elem))
+       (:name elem))))
+
+
 (defmethod math2owl Fraction
-  [elem & {:keys [subj]}]
-  (let [subj (or subj (new-blank-node "frac"))
-        num   (math2owl (:numerator elem))
+  [elem & {:keys [parent]}]
+  (let [frac (new-blank-node "frac")
+        num  (math2owl (:numerator elem))
         denom (math2owl (:denominator elem))]
-    (add-triples [subj :rdf:type :Fraction] ; POD in ontology, make this a subtype of Expression
-                 [subj :hasNumerator num]
-                 [subj :hasDenominator denom])
-    subj))
+    (add-triples (when parent [parent :hasFraction frac])
+                 [frac :rdf:type :Fraction] ; POD in ontology, make this a subtype of Expression
+                 [frac :hasNumerator num]
+                 [frac :hasDenominator denom])
+    frac))
 
 (defmethod math2owl Subscript
   [elem & _]
@@ -665,7 +634,7 @@
     (add-triples [sub :rdf:type :Subscript]
                  [sub :hasExpression (if (number? (:exp elem))
                                        {:value (:exp elem) :type :xsd:decimal}
-                                       (math2owl (:exp elem) :subj sub))])
+                                       (math2owl (:exp elem) :parent sub))])
     sub))
 
 (defmethod math2owl Superscript
@@ -674,19 +643,20 @@
     (add-triples [sup :rdf:type :Superscript]
                  [sup :hasExpression (if (number? (:exp elem))
                                        {:value (:exp elem) :type :xsd:decimal} 
-                                       (math2owl (:exp elem) :subj sup))])
+                                       (math2owl (:exp elem) :parent sup))])
     sup))
 
 (defmethod math2owl Sum
-  [elem & {:keys [subj]}] 
-  (let [subj (or subj (new-blank-node "sum"))]
-    (add-triples [subj :rdf:type :Sum]
-                 [subj :hasBody (math2owl (:body elem))])
+  [elem & {:keys [parent]}] 
+  (let [sum (new-blank-node "sum")]
+    (add-triples [parent :hasSum sum]
+                 [sum :rdf:type :Sum]
+                 [sum :hasBody (math2owl (:body elem))])
     (when-let [low (:lower elem)]
-      (add-triples [subj :hasLowerLimit (math2owl low)]))
+      (add-triples [sum :hasLowerLimit (math2owl low)]))
     (when-let [up  (:upper elem)]
-      (add-triples [subj :hasUpperLimit (math2owl up)]))
-    subj))
+      (add-triples [sum :hasUpperLimit (math2owl up)]))
+    parent))
 
 (defmethod math2owl :default
   [elem & _]
@@ -694,7 +664,6 @@
 
 (defn error2owl
   [err]
-  (reset! +triples+ [])
   (add-triples [:realURI :rdf:type :Error]
                [:realURI :hasMessage {:value (str err) :type :xsd:string}])
   @+triples+)
@@ -702,27 +671,53 @@
 (defn process-math
   [input]
   "Toplevel form that takes a formula wrapped in dollar signs, e.g. $ y = 1 $"
+  (reset! +triples+ [])
   (let [result (->> input
                     (preprocess-math)
                     (parse :math))]
     (when-let [result (or (:error result) (:math result))]
       (->> result
-           ((if (= (type result) MathExp) math2owl error2owl))
+           ((if (instance? MathExp result) math2owl error2owl))
            (map #(expand-all context+ %))
            (edn-ld.jena/write-triple-string prefixes)
            (println)))))
 
-(def i1 "$Y = \\beta_0$ ")
-(def i2 "$Y = \\beta_1X_1$")
-(def i3 "$Y = \\beta_0 + \\beta_1X_1$")
-(def i4 "$ F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}$")
-(def i5 "$  V^{\\alpha} $")
-(def i6 "$ (X) $")
-(def i7 "$Y = \\beta_0 + \\beta_1X_1 + \\beta_2X_2 + \\beta_3X_3 + \\beta_{12}X_1X_2 + \\beta_{13}X_1X_3 + \\beta_{23}X_2X_3 + \\beta_{11}X_1^2 + \\beta_{22}X_2^2 + \\beta_{33}X_3^2 + experimentalerror$")
-(def i8 "$\\frac{1}{2}$")
-(def i9 "$\\bar{x}$")
-(def i10 "$ x = \\frac{1}{2}$")
-(def i11 "$t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}$") ; POD fix this so Vf works. (Need hints from table).
-(def i12 "$ \\sum x$")
-(def i13 "$ y = \\sum \\limits_1^n x$")
-(def i14 "$T_n = \\sum\\limits_{i=1}^n t_{c,i}$")
+(def i1 "Y = \\beta_0 ")
+(def i2 "Y = \\beta_1X_1")
+(def i3 "Y = \\beta_0 + \\beta_1X_1")
+(def i4 " F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}")
+(def i5 "  V^{\\alpha} ")
+(def i6 " (X) ")
+(def i7 "Y = \\beta_0 + \\beta_1X_1 + \\beta_2X_2 + \\beta_3X_3 + \\beta_{12}X_1X_2 + \\beta_{13}X_1X_3 + \\beta_{23}X_2X_3 + \\beta_{11}X_1^2 + \\beta_{22}X_2^2 + \\beta_{33}X_3^2 + experimentalerror")
+(def i8 "\\frac{1}{2}")
+(def i9 "\\bar{x}")
+(def i10 " x = \\frac{1}{2}")
+(def i11 "t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000V f}") ; POD fix this so Vf works. (Need hints from table).
+(def i12 " \\sum x")
+(def i13 " y = \\sum \\limits_1^n x")
+
+(def known-var ["DC" "QC"])
+
+(def n1  " d_i = \\frac{D_0 - D}{2} + \\delta_i ")
+(def n2  "\\bar{D_i} = ( D_0 - d_i )")
+(def n3  " t_{c,i} = \\frac{\\pi \\bar{D_i} L}{1000Vf} ")
+(def n4  "T_n = \\sum\\limits_{i=1}^n t_{c,i}")
+(def n5  "w = k_wV^{\\alpha_w}f^{\\beta_w}d^{\\gamma_w}t^{\\sigma_w}")
+(def n6  "w_i = k_w V^{\\alpha_w} f^{\\beta_w} d_i^{\\gamma_w} (t_{w,i} + t)^{\\sigma_w}")
+(def n7  "0 \\le t \\le t_{c,i}")
+(def n8  " t_{w,i} = (\\frac{1}{k_w} V^{-\\alpha_w} f^{-\\beta_w} d_i^{-\\gamma_w} W_{i-1})^{\\frac{1}{\\sigma_w}} ")
+(def n9  "\\hat{N}")
+(def n10 "\\hat{N} = argmax_{i=1,2...}(\\hat{W} - W_i) for \\hat{W} - W_i \\ge 0")
+(def n11 "\\Delta_i = 2(w_i - W_{i-1})tan(\\Theta)")
+(def n12 "0 \\le t \\le t_{c,i}")
+(def n13 "\\Phi_i = k_r V^{\\alpha_r} f^{\\beta_r} d_i^{\\gamma_r}(t_{w,i} + t)^{\\sigma_r}")
+(def n14 " F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}")
+(def n15 " DC = N C_h t_h + (C_w + C_z) T_N")
+(def n16 "QC = \\sum\\limits_{i=1}^n \\ell_d\\int_{T_{i-1}}^{T_i} \\! (2\\delta_i - \\Delta_i)^2  \\, \\mathrm{d}t
+          + \\sum\\limits_{i=1}^n \\ell_r\\int_{T_{i-1}}^{T_i} \\! (\\Phi_i - R)^2  \\, \\mathrm{d}t ")
+(def n17 "P = E - (DC + GC + QC)")
+
+
+;;;(map process-math [i1 i2 i3 i4 i5 i6 i7 i8 i9 i10 i11 i12 i13 i14])
+;;;(map process-math [n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 n15 n16 n17])
+
