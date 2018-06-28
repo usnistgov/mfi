@@ -31,7 +31,7 @@
 ;;; POD As written pstate really has to be a variable! (Otherwise will need to substitute in @body tree.)
 (defmacro ^:private defparse [tag [pstate & keys-form] & body]
   `(defmethod parse ~tag [~'tag ~pstate ~@(or keys-form '(& ignore))]
-     (println ~tag)
+;     (println ~tag)
      (as-> ~pstate ~pstate
        (reset! +debug+ (update-in ~pstate [:tags] conj ~tag))
        (update-in ~pstate [:local] #(into [{}] %))
@@ -224,13 +224,9 @@
   (let [p1 (look pstate)
         p2 (look pstate 2)
         p3 (look pstate 3)]
-    (cond (and (or (number? p1) (instance? Symbol p1))
-               (or (LaTeXRelOp? p2) (= :eof p2)))
-          (parse :symbol-number pstate),
-          (and (or (number? p1) (instance? Symbol p1))
-               (#{\_ \^} p2)
-               (= :eof p3))
-          (parse :variable pstate),
+    (cond ;(and (or (number? p1) (instance? Symbol p1)) ; cutoff
+          ;     (or (LaTeXRelOp? p2) (#{:eof \}} p2)))
+          ;(parse :simple-factor pstate),
           :default
           (as-> pstate ?pstate
             (parse :term ?pstate :torder torder)
@@ -303,41 +299,39 @@
                                    (-> ?pstate :local first :factors)
                                    torder))))
 
-(defrecord Factor [symbol-number subscript superscript order])
+(defrecord Factor [symbol subscript superscript order])
 
-;;; factor ==   variable 
-;;;           | primary       subsuper
+;;; factor ==   simple-factor | primary subsuper
 (defparse :factor  
   [pstate & {:keys [forder]}]
+  (if (or (= \( (look pstate)) (LaTeX? (look pstate)))
+    (as-> pstate ?ps
+      (parse :primary ?ps)
+      (assoc-in ?ps [:local 0 :primary] (:result ?ps))
+      (parse :subsupers ?ps)
+      (assoc ?ps :result (->Factor (-> ?ps :local first :primary)
+                                   (-> ?ps :result :subscript)
+                                   (-> ?ps :result :superscript)
+                                   forder)))
+    (parse :simple-factor pstate :forder forder)))
+    
+;;; simple-factor ==   (number | symbol) subsuper
+(defparse :simple-factor
+  [pstate & {:keys [forder]}]
   (as-> pstate ?pstate
-    (if (or (= \( (look ?pstate)) (LaTeX? (look ?pstate)))
-      (as-> ?pstate ?ps
-        (parse :primary ?ps)
-        (assoc-in ?ps [:local 0 :symbol-number] (:result ?ps)))
-      (as-> ?pstate ?ps
-        (parse :variable ?ps)
-        (assoc-in ?ps [:local 0 :symbol-number] (:result ?ps))))
+    (read-token ?pstate)
+    (cond (instance? Symbol (:tkn ?pstate))
+          (assoc ?pstate :result (:tkn ?pstate)),
+          (number? (:tkn ?pstate))
+          (assoc ?pstate :result (->Symbol (:tkn ?pstate) false)),
+          :default
+          (assoc ?pstate :error {:expected "symbol or number" :got (:tkn ?pstate)}))
+    (assoc-in ?pstate [:local 0 :symbol-number] (:result ?pstate))
     (parse :subsupers ?pstate)
     (assoc ?pstate :result (->Factor (-> ?pstate :local first :symbol-number)
                                      (-> ?pstate :result :subscript)
                                      (-> ?pstate :result :superscript)
                                      forder))))
-
-
-(defrecord Variable [symbol subscript superscript])
-;;; variable ==   symbol-number subsuper
-(defparse :variable  
-  [pstate & _]
-  (as-> pstate ?pstate
-    (parse :symbol-number ?pstate)
-    (assoc-in ?pstate [:local 0 :symbol-number] (:result ?pstate))
-    (parse :subsupers ?pstate)
-    (assoc ?pstate :result (->Variable (-> ?pstate :local first :symbol-number)
-                                       (-> ?pstate :result :subscript)
-                                       (-> ?pstate :result :superscript)))))
-
-
-
 
 ;;; subsupers == ( (subscript (superscript)?)? | (superscript (subscript)?)? )
 ;;;              ( (subscript (superscript)?)? | (superscript (subscript)?)? )
@@ -376,17 +370,6 @@
         (and (LaTeX? (look pstate))
              (math-annotation (:name (look pstate))))
         (parse :annotated-exp pstate)))
-
-(defparse :symbol-number
-  [pstate]
-  (as-> pstate ?pstate
-    (read-token ?pstate)
-    (cond (instance? Symbol (:tkn ?pstate))
-          (assoc ?pstate :result (:tkn ?pstate)),
-          (number? (:tkn ?pstate))
-          (assoc ?pstate :result (->Symbol (:tkn ?pstate) false)),
-          :default
-          (assoc ?pstate :error {:expected "symbol or number" :got (:tkn ?pstate)}))))
 
 ;;; sum == \sum ( \limits lower-limit ? upper-limit ?)? body
 (defrecord Sum [body lower upper])
@@ -457,7 +440,7 @@
         (assoc ?ps :result (->Subscript (:result ?ps)))
         (assert-token ?ps \}))
       (as-> ?pstate ?ps
-        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (parse :simple-factor ?ps)
         (assoc ?ps :result (->Subscript (:result ?ps)))))))
 
 ;;; superscript ==  ^ expression | ^ \{ expression \}
@@ -472,7 +455,7 @@
         (assoc ?ps :result (->Superscript (:result ?ps)))
         (assert-token ?ps \}))
       (as-> ?pstate ?ps
-        (parse (if (and rel-ok? (LaTeXRelOp? ?ps)) :relation :expression) ?ps)
+        (parse :simple-factor ?ps)
         (assoc ?ps :result (->Superscript (:result ?ps)))))))
 
 (defn preprocess-math 
@@ -515,9 +498,10 @@
 
 ;;;; This is top-level of the translation.
 (defmethod math2owl MathExp
-  [elem & _]
+  [elem & {:keys [text]}]
   (reset! +triples+ [])
-  (add-triples [:realURI :rdf:type :MathContent])
+  (add-triples [:realURI :rdf:type :MathContent]
+               [:realURI :hasLaTeXText {:value text :tpe :xsd:string}])
   (math2owl (:content elem) :parent :realURI)
   @+triples+)
 
@@ -550,15 +534,20 @@
   (let [aexp (new-blank-node "aexp")
         exp (math2owl (:exp elem))]
   (add-triples
-   (when parent [parent :hasAnnotationExp exp])
+   (when parent [parent :hasAnnotationExp aexp])
    [aexp :rdf:type :AnnotatedExpression]
    [aexp :hasExpression exp]
    [aexp :hasAnnotation {:value (:name (:annotation elem)) :type :xsd:string}])
   aexp))
 
+(defn new-rooted-term  
+  []
+  (str "http://gov.nist.modelmeth/" (gensym "term")))
+
+
 (defmethod math2owl Term 
   [elem & {:keys [parent]}]
-  (let [term (new-blank-node "term")]
+  (let [term (new-rooted-term) #_(new-blank-node "term")]
     (add-triples (when parent [parent :hasTerm term])
                  [term :rdf:type :Term]
                  [term :hasTermOrder {:value (:order elem) :type :xsd:nonNegativeInteger}])
@@ -574,10 +563,10 @@
 (defmethod math2owl Factor
   [elem & {:keys [parent]}]
   (let [factor (new-blank-node "factor")
-        vname  (math2owl (:symbol-number elem) :parent factor)]
+        vname  (math2owl (:symbol elem) :parent factor)]
     (when parent (add-triples [parent :hasFactor factor]))
     (when-let [sub (:subscript     elem)] (add-triples [vname :hasSubscript   (math2owl sub :parent factor)]))
-    (if (number? (:name (:symbol-number elem)))
+    (if (number? (:name (:symbol elem)))
       (when-let [sup (:superscript   elem)] (add-triples [vname :hasExponent (math2owl sup :parent factor)]))
       (when-let [sup (:superscript   elem)] (add-triples [vname :hasSuperscript (math2owl sup :parent factor)])))
     factor))
@@ -594,28 +583,11 @@
                    [sym :hasName {:value (:name elem) :type :xsd:string}]))
     sym))
 
-(defmethod math2owl Variable
-  [elem & {:keys [parent]}]
-  (let [sym (new-blank-node "sym")]
-    (if (number? (:name (:symbol elem)))
-      (add-triples (when parent [parent :hasValue sym])
-                   [sym :rdf:type :LiteralNumber]
-                   [sym :hasValue {:value (:name (:symbol elem)) :type :xsd:decimal}])
-      (add-triples (when parent [parent :hasVariable sym])
-                   [sym :rdf:type :Variable]
-                   [sym :hasName {:value (:name (:symbol elem)) :type :xsd:string}]))
-    (when-let [sub (:subscript     elem)] (add-triples [sym :hasSubscript   (math2owl sub :parent sym)]))
-    (if (number? (:name (:symbol elem)))
-      (when-let [sup (:superscript   elem)] (add-triples [sym :hasExponent (math2owl sup :parent sym)]))
-      (when-let [sup (:superscript   elem)] (add-triples [sym :hasSuperscript (math2owl sup :parent sym)])))
-    sym))
-
 (defmethod math2owl LaTeXRelOp
   [elem & _]
   (keyword
    (or (#{\+ "plus", \- "minus"} (:name elem))
        (:name elem))))
-
 
 (defmethod math2owl Fraction
   [elem & {:keys [parent]}]
@@ -663,8 +635,9 @@
   elem)
 
 (defn error2owl
-  [err]
+  [err & {:keys [text]}]
   (add-triples [:realURI :rdf:type :Error]
+               [:realURI :hasLaTeXText {:value text :type :xsd:string}]
                [:realURI :hasMessage {:value (str err) :type :xsd:string}])
   @+triples+)
 
@@ -677,7 +650,7 @@
                     (parse :math))]
     (when-let [result (or (:error result) (:math result))]
       (->> result
-           ((if (instance? MathExp result) math2owl error2owl))
+           (#((if (instance? MathExp result) math2owl error2owl) % :text input))
            (map #(expand-all context+ %))
            (edn-ld.jena/write-triple-string prefixes)
            (println)))))
@@ -707,17 +680,18 @@
 (def n7  "0 \\le t \\le t_{c,i}")
 (def n8  " t_{w,i} = (\\frac{1}{k_w} V^{-\\alpha_w} f^{-\\beta_w} d_i^{-\\gamma_w} W_{i-1})^{\\frac{1}{\\sigma_w}} ")
 (def n9  "\\hat{N}")
-(def n10 "\\hat{N} = argmax_{i=1,2...}(\\hat{W} - W_i) for \\hat{W} - W_i \\ge 0")
-(def n11 "\\Delta_i = 2(w_i - W_{i-1})tan(\\Theta)")
-(def n12 "0 \\le t \\le t_{c,i}")
-(def n13 "\\Phi_i = k_r V^{\\alpha_r} f^{\\beta_r} d_i^{\\gamma_r}(t_{w,i} + t)^{\\sigma_r}")
-(def n14 " F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}")
-(def n15 " DC = N C_h t_h + (C_w + C_z) T_N")
-(def n16 "QC = \\sum\\limits_{i=1}^n \\ell_d\\int_{T_{i-1}}^{T_i} \\! (2\\delta_i - \\Delta_i)^2  \\, \\mathrm{d}t
+(def n10 "\\hat{N} = argmax_{i=1,2...}(\\hat{W} - W_i) ")
+(def n11 "\\hat{W} - W_i \\ge 0")
+(def n12 "\\Delta_i = 2(w_i - W_{i-1})tan(\\Theta)")
+(def n13 "0 \\le t \\le t_{c,i}")
+(def n14 "\\Phi_i = k_r V^{\\alpha_r} f^{\\beta_r} d_i^{\\gamma_r}(t_{w,i} + t)^{\\sigma_r}")
+(def n15 " F_i = k_c V^{\\alpha_c} f^{\\beta_c} d_i^{\\gamma_c}(t_{w,i} + t)^{\\sigma_c}")
+(def n16 " DC = N C_h t_h + (C_w + C_z) T_N")
+(def n17 "QC = \\sum\\limits_{i=1}^n \\ell_d\\int_{T_{i-1}}^{T_i} \\! (2\\delta_i - \\Delta_i)^2  \\, \\mathrm{d}t
           + \\sum\\limits_{i=1}^n \\ell_r\\int_{T_{i-1}}^{T_i} \\! (\\Phi_i - R)^2  \\, \\mathrm{d}t ")
-(def n17 "P = E - (DC + GC + QC)")
+(def n18 "P = E - (DC + GC + QC)")
 
 
 ;;;(map process-math [i1 i2 i3 i4 i5 i6 i7 i8 i9 i10 i11 i12 i13 i14])
-;;;(map process-math [n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 n15 n16 n17])
+;;;(map process-math [n1 n2 n3 n4 n5 n6 n7 n8 n9 #_n10 n11 n12 n13 n14 n15 n16 #_n17 n18])
 
